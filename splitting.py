@@ -18,53 +18,50 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 
 def split_data(
     y: np.ndarray,
     df: pd.DataFrame | None = None,
-    test_size: float = 0.15,
+    n_splits: int = 5,
     val_size: float = 0.15,
     random_state: int = 42,
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
-    """Split dataset indices into train, validation, and test subsets.
+    """Return stratified k-fold splits.
 
-    The default strategy performs a single stratified random split preserving
-    the class ratio in each subset.
+    Each fold reserves ``1/n_splits`` of the data as the test set.
+    The remaining ``(n_splits-1)/n_splits`` is further split into train
+    (minus a small stratified validation hold-out) and validation.
 
     Args:
         y:            Label array of shape ``(N,)`` with values in ``{0, 1}``.
-                      Used for stratification.
         df:           Optional full DataFrame (same row order as ``y``).
-                      Required for group-aware splits.
-        test_size:    Fraction of samples reserved for the held-out test set.
-        val_size:     Fraction of samples reserved for validation.
-        random_state: Random seed for reproducible splits.
+        n_splits:     Number of folds (default 5).
+        val_size:     Fraction of the *training* portion reserved for validation.
+        random_state: Random seed for reproducibility.
 
     Returns:
-        A list of ``(idx_train, idx_val, idx_test)`` tuples of integer index
-        arrays.  ``idx_val`` may be ``None``.
-
-    Student task:
-        Replace or extend the skeleton below.  The only contract is that the
-        function returns the list described above.
+        A list of ``(idx_train, idx_val, idx_test)`` tuples.
     """
-
     idx = np.arange(len(y))
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
 
-    idx_train_val, idx_test = train_test_split(
-        idx,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y,
-    )
-    relative_val = val_size / (1.0 - test_size)
-    idx_train, idx_val = train_test_split(
-        idx_train_val,
-        test_size=relative_val,
-        random_state=random_state,
-        stratify=y[idx_train_val],
-    )
-    return [(idx_train, idx_val, idx_test)]
+    splits: list[tuple[np.ndarray, np.ndarray | None, np.ndarray]] = []
 
+    for train_val_idx, test_idx in skf.split(idx, y):
+        # Further split train_val into train / val (stratified)
+        if val_size > 0 and len(train_val_idx) > 10:
+            train_idx, val_idx = train_test_split(
+                train_val_idx,
+                test_size=val_size,
+                random_state=random_state,
+                stratify=y[train_val_idx],
+            )
+        else:
+            train_idx = train_val_idx
+            val_idx = None
+
+        splits.append((train_idx, val_idx, test_idx))
+
+    return splits

@@ -10,10 +10,14 @@ and their signatures must not change.
 
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.decomposition import PCA
 from sklearn.metrics import f1_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 
@@ -25,14 +29,38 @@ class HallucinationProbe(nn.Module):
     built lazily in ``fit()`` once the feature dimension is known.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        hidden_dims: tuple[int, ...] = (128, 64),
+        dropout: float = 0.6,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-2,
+        max_epochs: int = 200,
+        patience: int = 30,
+        es_val_size: float = 0.15,
+        scheduler_tmax: int = 100,
+        use_pca: bool = True,
+        pca_components: int = 256,
+    ) -> None:
         super().__init__()
         self._net: nn.Sequential | None = None  # built lazily in fit()
         self._scaler = StandardScaler()
+        self._pca: PCA | None = None
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
 
+        self.hidden_dims = hidden_dims
+        self.dropout = dropout
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.max_epochs = max_epochs
+        self.patience = patience
+        self.es_val_size = es_val_size
+        self.scheduler_tmax = scheduler_tmax
+        self.use_pca = use_pca
+        self.pca_components = pca_components
+
     # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the network definition below.
+    # Network builder
     # ------------------------------------------------------------------
     def _build_network(self, input_dim: int) -> None:
         """Instantiate the network layers.
@@ -42,14 +70,19 @@ class HallucinationProbe(nn.Module):
         Args:
             input_dim: Feature vector dimensionality.
         """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
+        layers: list[nn.Module] = []
+        dims = [input_dim, *self.hidden_dims, 1]
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:  # not the final output layer
+                layers.append(nn.BatchNorm1d(dims[i + 1]))
+                layers.append(nn.ReLU())
+                layers.append(nn.Dropout(self.dropout))
+        self._net = nn.Sequential(*layers)
 
     # ------------------------------------------------------------------
-
+    # Forward pass
+    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass — returns raw logits of shape ``(n_samples,)``.
 
@@ -66,7 +99,7 @@ class HallucinationProbe(nn.Module):
         return self._net(x).squeeze(-1)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Train the probe on labelled feature vectors.
+        """Train the probe on labelled feature vectors with early stopping.
 
         Scales features with ``StandardScaler``, builds the network if needed,
         and optimises with Adam + ``BCEWithLogitsLoss``.
@@ -81,30 +114,77 @@ class HallucinationProbe(nn.Module):
         """
         X_scaled = self._scaler.fit_transform(X)
 
-        self._build_network(X_scaled.shape[1])
+        # Optional PCA for dimensionality reduction
+        if self.use_pca and X_scaled.shape[1] > self.pca_components:
+            n_comp = min(self.pca_components, X_scaled.shape[0] - 1, X_scaled.shape[1])
+            self._pca = PCA(n_components=n_comp, random_state=42)
+            X_scaled = self._pca.fit_transform(X_scaled)
 
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
+        # Internal train / early-stopping split (stratified)
+        if self.es_val_size > 0 and len(y) > 20:
+            X_tr, X_es, y_tr, y_es = train_test_split(
+                X_scaled,
+                y,
+                test_size=self.es_val_size,
+                random_state=42,
+                stratify=y,
+            )
+        else:
+            X_tr, y_tr = X_scaled, y
+            X_es, y_es = X_scaled, y
 
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
+        self._build_network(X_tr.shape[1])
+
+        X_tr_t = torch.from_numpy(X_tr).float()
+        y_tr_t = torch.from_numpy(y_tr.astype(np.float32))
+        X_es_t = torch.from_numpy(X_es).float()
+        y_es_t = torch.from_numpy(y_es.astype(np.float32))
+
+        # Class-weighted loss
+        n_pos = int(y_tr.sum())
+        n_neg = len(y_tr) - n_pos
         pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.lr, weight_decay=self.weight_decay
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.scheduler_tmax, eta_min=self.lr * 1e-2
+        )
+
+        best_loss = float("inf")
+        best_state: dict | None = None
+        epochs_no_improve = 0
 
         self.train()
-        for _ in range(200):
+        for epoch in range(self.max_epochs):
             optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
+            logits = self(X_tr_t)
+            loss = criterion(logits, y_tr_t)
             loss.backward()
             optimizer.step()
-        # ------------------------------------------------------------------
+            scheduler.step()
+
+            # Early-stopping check on validation loss
+            self.eval()
+            with torch.no_grad():
+                es_logits = self(X_es_t)
+                es_loss = criterion(es_logits, y_es_t).item()
+
+                if es_loss < best_loss:
+                    best_loss = es_loss
+                    best_state = copy.deepcopy(self.state_dict())
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                    if epochs_no_improve >= self.patience:
+                        break
+            self.train()
+
+        # Restore best weights
+        if best_state is not None:
+            self.load_state_dict(best_state)
 
         self.eval()
         return self
@@ -170,6 +250,8 @@ class HallucinationProbe(nn.Module):
             Used to compute AUROC.
         """
         X_scaled = self._scaler.transform(X)
+        if self._pca is not None:
+            X_scaled = self._pca.transform(X_scaled)
         X_t = torch.from_numpy(X_scaled).float()
         with torch.no_grad():
             logits = self(X_t)

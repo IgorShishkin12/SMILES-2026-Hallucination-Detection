@@ -56,7 +56,7 @@ from splitting import split_data
 DATA_FILE     = "./data/dataset.csv"   # path to the dataset CSV
 OUTPUT_FILE   = "results.json"         # where to write the results summary
 BATCH_SIZE    = 4
-USE_GEOMETRIC = False                  # set True to enable geometric feature extraction
+USE_GEOMETRIC = True                   # set True to enable geometric feature extraction
 TEST_FILE        = "./data/test.csv"   # competition test set (labels are null)
 PREDICTIONS_FILE = "predictions.csv"   # output file with predicted labels
 
@@ -114,6 +114,22 @@ if __name__=='__main__':
     all_features: list = []
     t0 = time.time()
 
+    # Pre-compute prompt token lengths for response-aware pooling
+    print("Computing prompt token lengths ...")
+    prompt_texts = [row['prompt'] for _, row in df.iterrows()]
+    prompt_lens: list[int] = []
+    for p_start in tqdm(range(0, len(prompt_texts), BATCH_SIZE),
+                        desc="Tokenising prompts", unit="batch"):
+        p_batch = prompt_texts[p_start : p_start + BATCH_SIZE]
+        p_enc = tokenizer(
+            p_batch,
+            padding=False,
+            truncation=True,
+            max_length=MAX_LENGTH,
+        )
+        for ids in p_enc["input_ids"]:
+            prompt_lens.append(len(ids))
+
     for start in tqdm(range(0, len(all_texts), BATCH_SIZE),
                     desc="Extracting & aggregating", unit="batch"):
 
@@ -148,6 +164,7 @@ if __name__=='__main__':
                 hidden[i],   # (n_layers, seq_len, hidden_dim)
                 mask[i],     # (seq_len,)
                 use_geometric=USE_GEOMETRIC,
+                response_start=prompt_lens[start + i],
             )
             all_features.append(feat.cpu())
 
@@ -184,6 +201,21 @@ if __name__=='__main__':
     # ── Extract features for test set (same loop as Section 4) ───────────────
     test_features: list = []
 
+    # Pre-compute prompt token lengths for test set
+    test_prompt_texts = [row['prompt'] for _, row in df_test.iterrows()]
+    test_prompt_lens: list[int] = []
+    for p_start in tqdm(range(0, len(test_prompt_texts), BATCH_SIZE),
+                        desc="Tokenising test prompts", unit="batch"):
+        p_batch = test_prompt_texts[p_start : p_start + BATCH_SIZE]
+        p_enc = tokenizer(
+            p_batch,
+            padding=False,
+            truncation=True,
+            max_length=MAX_LENGTH,
+        )
+        for ids in p_enc["input_ids"]:
+            test_prompt_lens.append(len(ids))
+
     for start in tqdm(range(0, len(test_texts), BATCH_SIZE),
                     desc="Test extraction & aggregation", unit="batch"):
 
@@ -207,6 +239,7 @@ if __name__=='__main__':
         for i in range(hidden.size(0)):
             feat = aggregation_and_feature_extraction(
                 hidden[i], mask[i], use_geometric=USE_GEOMETRIC,
+                response_start=test_prompt_lens[start + i],
             )
             test_features.append(feat.cpu())
 
