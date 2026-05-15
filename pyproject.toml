@@ -1,0 +1,17 @@
+[project]
+name = "smiles-hallucination-detection"
+version = "0.1.0"
+description = "SMILES-2026 Hallucination Detection"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "datasets>=2.14.0",
+    "scikit-learn>=1.3.0",
+    "numpy>=1.24.0",
+    "pandas>=1.5.0",
+    "tqdm>=4.65.0",
+]
+
+[tool.uv]
+python-preference = "only-managed"
