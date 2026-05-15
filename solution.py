@@ -47,6 +47,7 @@ from tqdm import tqdm
 
 from aggregation import aggregation_and_feature_extraction
 from evaluate import print_summary, run_evaluation, save_predictions, save_results
+from transformers import AutoModelForCausalLM
 from model import MAX_LENGTH, get_model_and_tokenizer
 from probe import HallucinationProbe
 from splitting import split_data
@@ -57,6 +58,8 @@ DATA_FILE     = "./data/dataset.csv"   # path to the dataset CSV
 OUTPUT_FILE   = "results.json"         # where to write the results summary
 BATCH_SIZE    = 4
 USE_GEOMETRIC = True                   # set True to enable geometric feature extraction
+USE_ATTENTION = True                   # set True to enable Lookback-Lens attention features
+USE_HIDDEN    = True                   # set False to use attention features only
 TEST_FILE        = "./data/test.csv"   # competition test set (labels are null)
 PREDICTIONS_FILE = "predictions.csv"   # output file with predicted labels
 
@@ -74,7 +77,9 @@ if __name__=='__main__':
     print(f"Device       : {device}")
     print(f"Data         : {DATA_FILE}")
     print(f"Max length   : {MAX_LENGTH} tokens")
+    print(f"Hidden feats   : {USE_HIDDEN}")
     print(f"Geometric feats: {USE_GEOMETRIC}")
+    print(f"Attention feats: {USE_ATTENTION}")
 
 
     df = pd.read_csv(DATA_FILE)
@@ -105,11 +110,16 @@ if __name__=='__main__':
     print(f"── label : {int(row0['label'])}  ({label_str})")
 
 
-    # Load the LLM
-    model, tokenizer = get_model_and_tokenizer()
+    # Load the LLM - eager attention required for output_attentions support
+    _, tokenizer = get_model_and_tokenizer()
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model.to(device)
+    model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen2.5-0.5B",
+        output_hidden_states=True,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="eager",
+    ).eval().to(device)
 
     all_features: list = []
     t0 = time.time()
@@ -150,21 +160,33 @@ if __name__=='__main__':
         # each with shape (batch, seq_len, hidden_dim).
         # Index 0 → token embeddings; index k → transformer layer k.
         with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_attentions=USE_ATTENTION,
+            )
 
         # ── 3. Stack all layers into one tensor, move to CPU ─────────────────
         # Shape: (batch, n_layers, seq_len, hidden_dim)
-        hidden = torch.stack(outputs.hidden_states, dim=1).float()
+        hidden = torch.stack(outputs.hidden_states, dim=1).float().cpu()
         mask   = attention_mask.cpu()
+
+        # Attention maps: tuple of (batch, heads, seq_len, seq_len) per layer
+        batch_attentions = outputs.attentions if USE_ATTENTION else None
 
         # ── 4. Aggregate each sample and store the compact feature vector ─────
         # The raw `hidden` tensor is released at the end of this loop iteration.
         for i in range(hidden.size(0)):
+            sample_attentions = None
+            if batch_attentions is not None:
+                sample_attentions = tuple(a[i].cpu() for a in batch_attentions)
             feat = aggregation_and_feature_extraction(
                 hidden[i],   # (n_layers, seq_len, hidden_dim)
                 mask[i],     # (seq_len,)
                 use_geometric=USE_GEOMETRIC,
                 response_start=prompt_lens[start + i],
+                attentions=sample_attentions,
+                use_hidden=USE_HIDDEN,
             )
             all_features.append(feat.cpu())
 
@@ -185,7 +207,8 @@ if __name__=='__main__':
         print(f"  Fold {i + 1}: train={len(tr)}  "
             f"val={len(va) if va is not None else 'N/A'}  test={len(te)}")
 
-    fold_results = run_evaluation(splits, X, y, HallucinationProbe)
+    ProbeFactory = HallucinationProbe if USE_HIDDEN else (lambda: HallucinationProbe(use_pca=False))
+    fold_results = run_evaluation(splits, X, y, ProbeFactory)
     
     print_summary(fold_results, X.shape[1], len(X), extract_time)
     save_results(fold_results, X.shape[1], len(X), extract_time, OUTPUT_FILE)
@@ -231,15 +254,25 @@ if __name__=='__main__':
         attention_mask = encoding["attention_mask"].to(device)
 
         with torch.no_grad():
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_attentions=USE_ATTENTION,
+            )
 
-        hidden = torch.stack(outputs.hidden_states, dim=1).float()
+        hidden = torch.stack(outputs.hidden_states, dim=1).float().cpu()
         mask   = attention_mask.cpu()
+        batch_attentions = outputs.attentions if USE_ATTENTION else None
 
         for i in range(hidden.size(0)):
+            sample_attentions = None
+            if batch_attentions is not None:
+                sample_attentions = tuple(a[i].cpu() for a in batch_attentions)
             feat = aggregation_and_feature_extraction(
                 hidden[i], mask[i], use_geometric=USE_GEOMETRIC,
                 response_start=test_prompt_lens[start + i],
+                attentions=sample_attentions,
+                use_hidden=USE_HIDDEN,
             )
             test_features.append(feat.cpu())
 
@@ -253,7 +286,7 @@ if __name__=='__main__':
         np.concatenate([idx_tr, idx_va]) if idx_va is not None else idx_tr
         for idx_tr, idx_va, _ in splits
     ]))
-    final_probe = HallucinationProbe()
+    final_probe = ProbeFactory()
     final_probe.fit(X[idx_non_test], y[idx_non_test])
 
     # ── Predict and save ────────────────────────────────────────────────────

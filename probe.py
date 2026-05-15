@@ -41,6 +41,8 @@ class HallucinationProbe(nn.Module):
         scheduler_tmax: int = 100,
         use_pca: bool = True,
         pca_components: int = 256,
+        ranking_weight: float = 0.0,
+        ranking_pairs: int = 512,
     ) -> None:
         super().__init__()
         self._net: nn.Sequential | None = None  # built lazily in fit()
@@ -58,6 +60,8 @@ class HallucinationProbe(nn.Module):
         self.scheduler_tmax = scheduler_tmax
         self.use_pca = use_pca
         self.pca_components = pca_components
+        self.ranking_weight = ranking_weight
+        self.ranking_pairs = ranking_pairs
 
     # ------------------------------------------------------------------
     # Network builder
@@ -79,6 +83,21 @@ class HallucinationProbe(nn.Module):
                 layers.append(nn.ReLU())
                 layers.append(nn.Dropout(self.dropout))
         self._net = nn.Sequential(*layers)
+
+    # ------------------------------------------------------------------
+    # Ranking loss
+    # ------------------------------------------------------------------
+    def _pairwise_ranking_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """BPR-style ranking loss: hallucinated samples should score higher than truthful ones."""
+        pos_idx = (labels == 1).nonzero(as_tuple=False).squeeze(-1)
+        neg_idx = (labels == 0).nonzero(as_tuple=False).squeeze(-1)
+        if pos_idx.numel() == 0 or neg_idx.numel() == 0:
+            return torch.tensor(0.0, requires_grad=True)
+        n = min(self.ranking_pairs, pos_idx.numel() * neg_idx.numel())
+        i = torch.randint(0, pos_idx.numel(), (n,))
+        j = torch.randint(0, neg_idx.numel(), (n,))
+        # -log(sigmoid(pos - neg)) -> encourages pos > neg (directly optimises AUROC)
+        return -torch.log(torch.sigmoid(logits[pos_idx[i]] - logits[neg_idx[j]]) + 1e-8).mean()
 
     # ------------------------------------------------------------------
     # Forward pass
@@ -161,7 +180,9 @@ class HallucinationProbe(nn.Module):
         for epoch in range(self.max_epochs):
             optimizer.zero_grad()
             logits = self(X_tr_t)
-            loss = criterion(logits, y_tr_t)
+            bce = criterion(logits, y_tr_t)
+            rank = self._pairwise_ranking_loss(logits, y_tr_t)
+            loss = (1.0 - self.ranking_weight) * bce + self.ranking_weight * rank
             loss.backward()
             optimizer.step()
             scheduler.step()
